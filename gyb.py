@@ -146,6 +146,9 @@ def SetupOptionParser(argv):
   tls_choices = ['TLSv1_2', 'TLSv1_3']
   tls_min_default = tls_choices[-1]
   parser = argparse.ArgumentParser(add_help=False)
+  parser.add_argument('--debug-backup',
+    action='store_true',
+    help='Print timestamped batch, quota, retry and message error diagnostics.')
   parser.add_argument('--email',
     dest='email',
     help='Full email address of user or group to act against')
@@ -297,7 +300,7 @@ GOOGLEQUOTAS = {
   "gmail.users.labels.delete": 5,
   "gmail.users.labels.list": 1,
   "gmail.users.messages.batchDelete": 50,
-  "gmail.users.messages.get": 5,
+  "gmail.users.messages.get": 20,
   "gmail.users.messages.import": 25,
   "gmail.users.messages.insert": 25,
   "gmail.users.messages.list": 5,
@@ -400,7 +403,8 @@ class QuotaBucket:
 # to add rate limiting for an API group. Then add methods to the GOOGLEQUOTAS
 # dictionary above.
 buckets = {
-    "gmail": QuotaBucket(250, 0.5, 125),
+    # 60 units/sec leaves headroom below 6,000 units/minute/user.
+    "gmail": QuotaBucket(100, 1.0, 60),
     "groupsmigration": QuotaBucket(10, 1, 10),
 }
 
@@ -802,16 +806,28 @@ def buildGAPIServiceObject(api, soft_errors=False):
       e = e.args[0]
     systemErrorExit(5, e)
 
+def log_backup_debug(message):
+    if not getattr(options, 'debug_backup', False):
+        return
+    timestamp = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+    sys.stderr.write('\n[%s] %s\n' % (timestamp, message))
+    sys.stderr.flush()
+
+
 def _backoff(n, retries, reason):
     wait_on_fail = (2 ** n) if (2 ** n) < 60 else 60
     randomness = float(random.randint(1,1000)) / 1000
     wait_on_fail += randomness
-    if n > 3:
+    if getattr(options, 'debug_backup', False):
+        log_backup_debug('Temp error %s. Backing off %.3f seconds before '
+                         'attempt %s/%s' %
+                         (reason, wait_on_fail, n + 1, retries))
+    elif n > 3:
         sys.stderr.write('\nTemp error %s. Backing off %s seconds...'
-          % (reason, int(wait_on_fail)))
+                         % (reason, int(wait_on_fail)))
     time.sleep(wait_on_fail)
-    if n > 3:
-      sys.stderr.write('attempt %s/%s\n' % (n+1, retries))
+    if n > 3 and not getattr(options, 'debug_backup', False):
+        sys.stderr.write('attempt %s/%s\n' % (n + 1, retries))
 
 def callGAPI(service, function, soft_errors=False, throw_reasons=[], retry_reasons=[], **kwargs):
   retries = 10
@@ -824,7 +840,15 @@ def callGAPI(service, function, soft_errors=False, throw_reasons=[], retry_reaso
       else:
         method = service
        
+      quota_started = time.monotonic()
       getQuota(method)
+      if isinstance(method, BatchHttpRequest):
+        log_backup_debug('Sending batch: %s requests, %s accounted units, '
+                         'quota wait %.3fs, HTTP attempt %s/%s' %
+                         (len(method._requests),
+                          sum(GOOGLEQUOTAS.get(request.methodId, 0)
+                              for request in method._requests.values()),
+                          time.monotonic() - quota_started, n, retries))
 
       return method.execute()
     except googleapiclient.errors.MediaUploadSizeError as e:
@@ -1852,6 +1876,71 @@ def backup_chat(request_id, response, exception):
        INSERT INTO labels (message_num, label) VALUES (?, ?)""",
                           (message_num, label))
 
+def backup_batch(batch):
+  """Retry transient per-message failures outside the batch callback."""
+  retries = 10
+  pending = dict(batch._requests)
+  log_backup_debug('Backup batch started: %s messages; PID %s; '
+                   'message cost %s; bucket size %s, refill %s every %ss' %
+                   (len(pending), os.getpid(),
+                    GOOGLEQUOTAS['gmail.users.messages.get'],
+                    buckets['gmail'].size, buckets['gmail'].refill_size,
+                    buckets['gmail'].interval))
+  for attempt in range(1, retries + 1):
+    failed = {}
+    permanent_errors = []
+
+    def collect_result(request_id, response, exception):
+      if exception is None:
+        backup_message(request_id, response, None)
+        return
+      status = int(exception.resp.status) if isinstance(
+        exception, googleapiclient.errors.HttpError) else 0
+      reason = None
+      if status:
+        try:
+          error = json.loads(exception.content.decode('utf-8'))
+          reason = error['error']['errors'][0]['reason']
+        except (KeyError, IndexError, TypeError, UnicodeDecodeError,
+                json.decoder.JSONDecodeError):
+          pass
+      log_backup_debug('Message %s failed (%s): %s' %
+                       (request_id, reason or status or 'unknown', exception))
+      if not getattr(options, 'debug_backup', False) and status != 429 and reason not in (
+          'rateLimitExceeded', 'userRateLimitExceeded'):
+        sys.stderr.write('\nMessage %s failed (%s): %s\n' %
+                         (request_id, reason or status or 'unknown', exception))
+      if status == 429 or status >= 500 or reason in (
+          'rateLimitExceeded', 'userRateLimitExceeded', 'backendError'):
+        failed[request_id] = pending[request_id]
+      else:
+        permanent_errors.append(exception)
+
+    retry_batch = gmail.new_batch_http_request()
+    for message_id, request in pending.items():
+      retry_batch.add(request, callback=collect_result, request_id=message_id)
+    try:
+      callGAPI(retry_batch, None)
+    finally:
+      # Preserve successful messages even if another request cannot be retried.
+      sqlconn.commit()
+    log_backup_debug('Backup batch attempt %s/%s finished: %s succeeded, '
+                     '%s retryable failures, %s permanent failures' %
+                     (attempt, retries,
+                      len(pending) - len(failed) - len(permanent_errors),
+                      len(failed), len(permanent_errors)))
+    if permanent_errors:
+      systemErrorExit(1, str(permanent_errors[0]))
+    if not failed:
+      return
+    if attempt == retries:
+      systemErrorExit(1, 'Backup stopped after %s attempts: %s messages still '
+                      'failed. Rerun backup to retry them.' %
+                      (retries, len(failed)))
+    _backoff(attempt, retries, 'transient batch message errors')
+    pending = failed
+
+
 def backup_message(request_id, response, exception):
   if exception is not None:
     print(exception)
@@ -2236,9 +2325,8 @@ def main(argv):
       if options.memory_limit:
         request_size += message_sizes[a_message]
       if len(gbatch._order) == options.batch_size or (options.memory_limit and request_size >= memory_limit):
-        callGAPI(gbatch, None, soft_errors=True)
+        backup_batch(gbatch)
         gbatch = gmail.new_batch_http_request()
-        sqlconn.commit()
         if options.memory_limit:
           request_size = message_sizes[a_message]
         rewrite_line("backed up %s of %s messages" %
@@ -2246,11 +2334,10 @@ def main(argv):
       gbatch.add(gmail.users().messages().get(userId='me',
         id=a_message, format='raw',
         fields='id,labelIds,internalDate,raw'),
-        callback=backup_message)
+        callback=backup_message, request_id=a_message)
       backed_up_messages += 1
     if len(gbatch._order) > 0:
-      callGAPI(gbatch, None, soft_errors=True)
-      sqlconn.commit()
+      backup_batch(gbatch)
       rewrite_line("backed up %s of %s messages" %
         (backed_up_messages, backup_count))
     print("\n")
