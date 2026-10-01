@@ -31,3 +31,8 @@ The original repository is `upstream`; your fork is `origin`.
 
 Continue using your existing config and backup folders outside the checkout.
 Source changes do not update the packaged `gyb` executable.
+
+Individual imports in `--action restore` commit their resume records after each
+message, including the default batch size of one. An interruption between Gmail
+accepting an import and the local commit can still cause that message to be
+imported again on the next run.

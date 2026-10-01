@@ -2511,6 +2511,8 @@ def main(argv):
           exception = e
         restored_message(request_id=str(message_num), response=response,
           exception=exception)
+        # Persist resume progress before starting the next individual import.
+        sqlconn.commit()
         rewrite_line('restored single large message (%s/%s)' % (current,
           restore_count))
         continue
